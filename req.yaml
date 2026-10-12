@@ -1,0 +1,15 @@
+password:
+  length: 12                      
+  rules:                          
+    - pattern: ".{12,}"
+      message: "at least 12 characters"
+    - pattern: "[A-Z]"
+      message: "one capital letter"
+    - pattern: "[0-9]"
+      message: "one number"
+    - pattern: "[!@#$%^&*]"
+      message: "one special character"
+    - pattern: "^(?!.*(012|123|234|345|456|567|678|789|987|876|765|654|543|432|321|210))"
+      message: "no digit sequences like 123 or 987"
+    - pattern: "(?i)^(?!{username}$)"
+      message: "must not be the username"

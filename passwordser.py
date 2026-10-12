@@ -1,154 +1,88 @@
-import os
-import re
-import ctypes
-import sqlite3
-import secrets
-import string
-import hashlib
-import hmac
+import os, re, ctypes, sqlite3, secrets, hashlib, hmac, platform, yaml
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
+here = os.path.dirname(os.path.abspath(__file__))
+DB = os.path.join(here, "passwords.db")
+ITERATIONS = 600_000
 
-folder = os.path.dirname(os.path.abspath(__file__))
-DB_NAME = os.path.join(folder, "passwords.db")
-LIB_PATH = os.path.join(folder, "libpassgen.dylib")
+# C library that makes the random password
+lib_name = "libpassgen.dylib" if platform.system() == "Darwin" else "libpassgen.so"
+lib = ctypes.CDLL(os.path.join(here, lib_name))
+lib.gen_password.argtypes = [ctypes.c_char_p, ctypes.c_int]
 
-lib = ctypes.CDLL(LIB_PATH)
-lib.gen_password.argtypes = [ctypes.POINTER(ctypes.c_char), ctypes.c_int]
-lib.gen_password.restype = ctypes.c_int
-
-
-def init_db():
-    with sqlite3.connect(DB_NAME) as db:
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                username TEXT PRIMARY KEY,
-                salt BLOB NOT NULL,
-                password_hash BLOB NOT NULL
-            )
-        """)
+# password rules come only from req.yaml
+config = yaml.safe_load(open(os.path.join(here, "req.yaml")))["password"]
 
 
-def check(username, password):
-    if len(password) != 12:
-        return False
-    if not any(c.isupper() for c in password):
-        return False
-    if not any(c.isdigit() for c in password):
-        return False
-    if not any(c in string.punctuation for c in password):
-        return False
-
-    sequences = [
-        "012", "123", "234", "345", "456", "567", "678", "789",
-        "987", "876", "765", "654", "543", "432", "321", "210"
-    ]
-
-    if any(s in password for s in sequences):
-        return False
-
-    return password.casefold() != username.casefold()
+def get_json():
+    data = request.get_json(silent=True) or {}
+    return data.get("username", "").strip(), data.get("password", "")
 
 
-def generate_password(username):
-    for _ in range(1000):
-        buf = ctypes.create_string_buffer(13)
-
-        if lib.gen_password(buf, 12) != 0:
-            raise RuntimeError("Password generation failed")
-
-        password = buf.value.decode("ascii")
-
-        if check(username, password):
-            return password
-
-    raise RuntimeError("Could not generate valid password")
+def hash_pw(pw, salt):
+    return hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, ITERATIONS)
 
 
-def make_hash(password):
-    salt = secrets.token_bytes(16)
-    hashed = hashlib.pbkdf2_hmac(
-        "sha256", password.encode(), salt, 600000
-    )
-    return salt, hashed
+@app.route("/")
+def home():
+    return "Password Service is running!"
 
 
-def verify_password(password, salt, saved_hash):
-    hashed = hashlib.pbkdf2_hmac(
-        "sha256", password.encode(), salt, 600000
-    )
-    return hmac.compare_digest(hashed, saved_hash)
-
-
-@app.route("/generate", methods=["POST"])
+@app.post("/generate")
 def generate():
-    data = request.get_json(silent=True) or {}
-    username = data.get("username", "").strip()
-
+    username, _ = get_json()
     if not username:
-        return jsonify({"error": "Enter username"}), 400
+        return jsonify(error="Enter username"), 400
 
-    try:
-        return jsonify({"password": generate_password(username)})
-    except RuntimeError:
-        app.logger.exception("Generation failed")
-        return jsonify({"error": "Generation failed"}), 500
+    for _ in range(1000):                       # try until all rules match
+        buf = ctypes.create_string_buffer(config["length"] + 1)
+        lib.gen_password(buf, config["length"])
+        pw = buf.value.decode()
+        if all(re.search(r["pattern"].replace("{username}", re.escape(username)), pw)
+               for r in config["rules"]):
+            return jsonify(password=pw)
+    return jsonify(error="Generation failed"), 500
 
 
-@app.route("/register", methods=["POST"])
+@app.post("/register")
 def register():
-    data = request.get_json(silent=True) or {}
-    username = data.get("username", "").strip()
-    password = data.get("password", "")
+    username, pw = get_json()
+    if not username or not pw:
+        return jsonify(error="Username and password required"), 400
 
-    if not username or not password:
-        return jsonify({"error": "Username and password required"}), 400
+    broken = [r["message"] for r in config["rules"]
+              if not re.search(r["pattern"].replace("{username}", re.escape(username)), pw)]
+    if broken:
+        return jsonify(error="Password rules not satisfied", broken_rules=broken), 400
 
-    if not check(username, password):
-        return jsonify({"error": "Password rules not satisfied"}), 400
-
-    salt, hashed = make_hash(password)
-
+    salt = secrets.token_bytes(16)
+    hashed = hash_pw(pw, salt)
     try:
-        with sqlite3.connect(DB_NAME) as db:
-            db.execute(
-                "INSERT INTO users VALUES (?, ?, ?)",
-                (username, salt, hashed)
-            )
+        with sqlite3.connect(DB) as db:
+            db.execute("INSERT INTO users VALUES (?, ?, ?)", (username, salt, hashed))
     except sqlite3.IntegrityError:
-        return jsonify({"error": "Username already exists"}), 409
-
-    return jsonify({
-        "message": "User registered successfully",
-        "username": username,
-        "password_hash": hashed.hex()
-    }), 201
+        return jsonify(error="Username already exists"), 409
+    return jsonify(message="User registered successfully",
+                   username=username, password_hash=hashed.hex()), 201
 
 
-@app.route("/verify", methods=["POST"])
+@app.post("/verify")
 def verify():
-    data = request.get_json(silent=True) or {}
-    username = data.get("username", "").strip()
-    password = data.get("password", "")
-
-    with sqlite3.connect(DB_NAME) as db:
-        row = db.execute(
-            "SELECT salt, password_hash FROM users WHERE username = ?",
-            (username,)
-        ).fetchone()
-
+    username, pw = get_json()
+    with sqlite3.connect(DB) as db:
+        row = db.execute("SELECT salt, password_hash FROM users WHERE username=?",
+                         (username,)).fetchone()
     if row is None:
-        return jsonify({"valid": False, "message": "User not found"}), 404
+        return jsonify(valid=False, message="User not found"), 404
 
-    valid = verify_password(password, row[0], row[1])
-
-    return jsonify({
-        "valid": valid,
-        "message": "Password is correct" if valid else "Password is incorrect"
-    })
+    ok = hmac.compare_digest(hash_pw(pw, row[0]), row[1])   # safe comparison
+    return jsonify(valid=ok,
+                   message="Password is correct" if ok else "Password is incorrect")
 
 
 if __name__ == "__main__":
-    init_db()
-    app.run(host="127.0.0.1", port=5001, debug=False)
+    with sqlite3.connect(DB) as db:
+        db.execute("CREATE TABLE IF NOT EXISTS users "
+                   "(username TEXT PRIMARY KEY, salt BLOB, password_hash BLOB)")
+    app.run(host="127.0.0.1", port=5001)
