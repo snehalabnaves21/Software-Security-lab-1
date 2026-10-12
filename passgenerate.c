@@ -1,7 +1,5 @@
 #include <stdlib.h>
 #include <string.h>
-
-/* macOS: clang -shared -fPIC -o libpassgen.dylib passgenerate.c */
 int gen_password(char *buf, int len)
 {
     char *chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*";

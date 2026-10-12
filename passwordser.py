@@ -5,29 +5,20 @@ app = Flask(__name__)
 here = os.path.dirname(os.path.abspath(__file__))
 DB = os.path.join(here, "passwords.db")
 ITERATIONS = 600_000
-
-# C library that makes the random password
 lib_name = "libpassgen.dylib" if platform.system() == "Darwin" else "libpassgen.so"
 lib = ctypes.CDLL(os.path.join(here, lib_name))
 lib.gen_password.argtypes = [ctypes.c_char_p, ctypes.c_int]
-
-# password rules come only from req.yaml
 config = yaml.safe_load(open(os.path.join(here, "req.yaml")))["password"]
-
-
 def get_json():
     data = request.get_json(silent=True) or {}
     return data.get("username", "").strip(), data.get("password", "")
 
-
 def hash_pw(pw, salt):
     return hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, ITERATIONS)
-
 
 @app.route("/")
 def home():
     return "Password Service is running!"
-
 
 @app.post("/generate")
 def generate():
@@ -35,7 +26,7 @@ def generate():
     if not username:
         return jsonify(error="Enter username"), 400
 
-    for _ in range(1000):                       # try until all rules match
+    for _ in range(1000):                       
         buf = ctypes.create_string_buffer(config["length"] + 1)
         lib.gen_password(buf, config["length"])
         pw = buf.value.decode()
@@ -76,7 +67,7 @@ def verify():
     if row is None:
         return jsonify(valid=False, message="User not found"), 404
 
-    ok = hmac.compare_digest(hash_pw(pw, row[0]), row[1])   # safe comparison
+    ok = hmac.compare_digest(hash_pw(pw, row[0]), row[1])   
     return jsonify(valid=ok,
                    message="Password is correct" if ok else "Password is incorrect")
 
